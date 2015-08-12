@@ -178,7 +178,8 @@ class LdaModel(interfaces.TransformationABC):
                  distributed=False, chunksize=2000, passes=1, update_every=1,
                  alpha='symmetric', eta=None, decay=0.5, offset=1.0,
                  eval_every=10, iterations=50, gamma_threshold=0.001,
-                 minimum_probability=0.01):
+                 minimum_probability=0.01, 
+                 max_em_iterations=1, em_threshold=0.001):
         """
         If given, start training from the iterable `corpus` straight away. If not given,
         the model is left untrained (presumably because you want to call `update()` manually).
@@ -256,6 +257,9 @@ class LdaModel(interfaces.TransformationABC):
         self.passes = passes
         self.update_every = update_every
         self.eval_every = eval_every
+        
+        self.max_em_iterations = max_em_iterations
+        self.em_threshold = em_threshold
 
         self.optimize_alpha = alpha == 'auto'
         if alpha == 'symmetric' or alpha is None:
@@ -465,14 +469,15 @@ class LdaModel(interfaces.TransformationABC):
             total_docs = len(chunk)
         corpus_words = sum(cnt for document in chunk for _, cnt in document)
         subsample_ratio = 1.0 * total_docs / len(chunk)
-        perwordbound = self.bound(chunk, subsample_ratio=subsample_ratio) / (subsample_ratio * corpus_words)
+        bound = self.bound(chunk, subsample_ratio=subsample_ratio)
+        perwordbound = bound / (subsample_ratio * corpus_words)
         logger.info("%.3f per-word bound, %.1f perplexity estimate based on a held-out corpus of %i documents with %i words" %
                     (perwordbound, numpy.exp2(-perwordbound), len(chunk), corpus_words))
         return perwordbound
 
     def update(self, corpus, chunksize=None, decay=None, offset=None,
                passes=None, update_every=None, eval_every=None, iterations=None,
-               gamma_threshold=None):
+               gamma_threshold=None, max_em_iterations=None, em_threshold=None):
         """
         Train the model with new documents, by EM-iterating over `corpus` until
         the topics converge (or until the maximum number of allowed iterations
@@ -507,6 +512,10 @@ class LdaModel(interfaces.TransformationABC):
             iterations = self.iterations
         if gamma_threshold is None:
             gamma_threshold = self.gamma_threshold
+        if max_em_iterations is None:
+            max_em_iterations = self.max_em_iterations
+        if em_threshold is None:
+            em_threshold = self.em_threshold
 
         try:
             lencorpus = len(corpus)
@@ -525,10 +534,15 @@ class LdaModel(interfaces.TransformationABC):
         if update_every:
             updatetype = "online"
             updateafter = min(lencorpus, update_every * self.numworkers * chunksize)
+            if max_em_iterations > 1:
+                logger.warn("It doesn't make sense to use max_em_iterations in online mode.")
         else:
             updatetype = "batch"
             updateafter = lencorpus
         evalafter = min(lencorpus, (eval_every or 0) * self.numworkers * chunksize)
+        
+        if max_em_iterations > 1 and not eval_every:
+            raise ValueError("eval_every must be set (usually to 1) for max_em_iterations > 1")
 
         updates_per_pass = max(1, lencorpus / updateafter)
         logger.info("running %s LDA training, %s topics, %i passes over "
@@ -548,68 +562,87 @@ class LdaModel(interfaces.TransformationABC):
         # while allowing it to "reset" on the first pass of each update
         def rho():
             return pow(offset + pass_ + (self.num_updates / chunksize), -decay)
-
+        
         for pass_ in xrange(passes):
-            if self.dispatcher:
-                logger.info('initializing %s workers' % self.numworkers)
-                self.dispatcher.reset(self.state)
-            else:
-                other = LdaState(self.eta, self.state.sstats.shape)
-            dirty = False
-
-            reallen = 0
-            for chunk_no, chunk in enumerate(utils.grouper(corpus, chunksize, as_numpy=True)):
-                reallen += len(chunk)  # keep track of how many documents we've processed so far
-
-                if eval_every and ((reallen == lencorpus) or ((chunk_no + 1) % (eval_every * self.numworkers) == 0)):
-                    self.log_perplexity(chunk, total_docs=lencorpus)
-
+            num_updates_at_pass_start = self.num_updates
+            last_perwordbound = 1e99
+            for em_iteration in xrange(max_em_iterations):
+                if em_iteration > 0:
+                    # reset num_updates so that we reset rho each em_iteration
+                    self.num_updates = num_updates_at_pass_start
+                total_perwordbound = 0.0
+                
                 if self.dispatcher:
-                    # add the chunk to dispatcher's job queue, so workers can munch on it
-                    logger.info('PROGRESS: pass %i, dispatching documents up to #%i/%i',
-                                pass_, chunk_no * chunksize + len(chunk), lencorpus)
-                    # this will eventually block until some jobs finish, because the queue has a small finite length
-                    self.dispatcher.putjob(chunk)
+                    logger.info('initializing %s workers' % self.numworkers)
+                    self.dispatcher.reset(self.state)
                 else:
-                    logger.info('PROGRESS: pass %i, at document #%i/%i',
-                                pass_, chunk_no * chunksize + len(chunk), lencorpus)
-                    gammat = self.do_estep(chunk, other)
+                    other = LdaState(self.eta, self.state.sstats.shape)
+                dirty = False
 
-                    if self.optimize_alpha:
-                        self.update_alpha(gammat, rho())
+                reallen = 0
+                for chunk_no, chunk in enumerate(utils.grouper(corpus, chunksize, as_numpy=True)):
+                    reallen += len(chunk)  # keep track of how many documents we've processed so far
 
-                dirty = True
-                del chunk
+                    if eval_every and ((reallen == lencorpus) or ((chunk_no + 1) % (eval_every * self.numworkers) == 0)):
+                        perwordbound = self.log_perplexity(chunk, total_docs=lencorpus)
+                        # keep track of the total bound for em_iterations
+                        total_perwordbound += perwordbound
 
-                # perform an M step. determine when based on update_every, don't do this after every chunk
-                if update_every and (chunk_no + 1) % (update_every * self.numworkers) == 0:
+                    if self.dispatcher:
+                        # add the chunk to dispatcher's job queue, so workers can munch on it
+                        logger.info('PROGRESS: pass %i, dispatching documents up to #%i/%i',
+                                    pass_, chunk_no * chunksize + len(chunk), lencorpus)
+                        # this will eventually block until some jobs finish, because the queue has a small finite length
+                        self.dispatcher.putjob(chunk)
+                    else:
+                        logger.info('PROGRESS: pass %i, at document #%i/%i',
+                                    pass_, chunk_no * chunksize + len(chunk), lencorpus)
+                        gammat = self.do_estep(chunk, other)
+
+                        if self.optimize_alpha:
+                            self.update_alpha(gammat, rho())
+
+                    dirty = True
+                    del chunk
+
+                    # perform an M step. determine when based on update_every, don't do this after every chunk
+                    if update_every and (chunk_no + 1) % (update_every * self.numworkers) == 0:
+                        if self.dispatcher:
+                            # distributed mode: wait for all workers to finish
+                            logger.info("reached the end of input; now waiting for all remaining jobs to finish")
+                            other = self.dispatcher.getstate()
+                        self.do_mstep(rho(), other, pass_ > 0)
+                        del other  # frees up memory
+
+                        if self.dispatcher:
+                            logger.info('initializing workers')
+                            self.dispatcher.reset(self.state)
+                        else:
+                            other = LdaState(self.eta, self.state.sstats.shape)
+                        dirty = False
+                # endfor single corpus iteration
+                if reallen != lencorpus:
+                    raise RuntimeError("input corpus size changed during training (don't use generators as input)")
+
+                if dirty:
+                    # finish any remaining updates
                     if self.dispatcher:
                         # distributed mode: wait for all workers to finish
                         logger.info("reached the end of input; now waiting for all remaining jobs to finish")
                         other = self.dispatcher.getstate()
                     self.do_mstep(rho(), other, pass_ > 0)
-                    del other  # frees up memory
-
-                    if self.dispatcher:
-                        logger.info('initializing workers')
-                        self.dispatcher.reset(self.state)
-                    else:
-                        other = LdaState(self.eta, self.state.sstats.shape)
+                    del other
                     dirty = False
-            # endfor single corpus iteration
-            if reallen != lencorpus:
-                raise RuntimeError("input corpus size changed during training (don't use generators as input)")
-
-            if dirty:
-                # finish any remaining updates
-                if self.dispatcher:
-                    # distributed mode: wait for all workers to finish
-                    logger.info("reached the end of input; now waiting for all remaining jobs to finish")
-                    other = self.dispatcher.getstate()
-                self.do_mstep(rho(), other, pass_ > 0)
-                del other
-                dirty = False
+                
+                relative_improvement = (last_perwordbound-total_perwordbound)/last_perwordbound
+                logger.info("EM Iteration %i: %.3f per-word bound, %.6f improvement" %
+                            (em_iteration, total_perwordbound, relative_improvement))
+                if relative_improvement < em_threshold:
+                    break
+                last_perwordbound = total_perwordbound
+            # endfor em_iteration
         # endfor entire corpus update
+
 
     def do_mstep(self, rho, other, extra_pass=False):
         """
@@ -627,6 +660,7 @@ class LdaModel(interfaces.TransformationABC):
 
         # print out some debug info at the end of each EM iteration
         self.print_topics(5)
+        diffnorm = numpy.mean(numpy.abs(diff))
         logger.info("topic diff=%f, rho=%f", numpy.mean(numpy.abs(diff)), rho)
 
         if not extra_pass:
