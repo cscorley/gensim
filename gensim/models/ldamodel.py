@@ -570,7 +570,6 @@ class LdaModel(interfaces.TransformationABC):
                 if em_iteration > 0:
                     # reset num_updates so that we reset rho each em_iteration
                     self.num_updates = num_updates_at_pass_start
-                total_perwordbound = 0.0
                 
                 if self.dispatcher:
                     logger.info('initializing %s workers' % self.numworkers)
@@ -586,7 +585,6 @@ class LdaModel(interfaces.TransformationABC):
                     if eval_every and ((reallen == lencorpus) or ((chunk_no + 1) % (eval_every * self.numworkers) == 0)):
                         perwordbound = self.log_perplexity(chunk, total_docs=lencorpus)
                         # keep track of the total bound for em_iterations
-                        total_perwordbound += perwordbound
 
                     if self.dispatcher:
                         # add the chunk to dispatcher's job queue, so workers can munch on it
@@ -634,12 +632,12 @@ class LdaModel(interfaces.TransformationABC):
                     del other
                     dirty = False
                 
-                relative_improvement = (last_perwordbound-total_perwordbound)/last_perwordbound
+                relative_improvement = (last_perwordbound-perwordbound)/last_perwordbound
                 logger.info("EM Iteration %i: %.3f per-word bound, %.6f improvement" %
-                            (em_iteration, total_perwordbound, relative_improvement))
+                            (em_iteration, perwordbound, relative_improvement))
                 if relative_improvement < em_threshold:
                     break
-                last_perwordbound = total_perwordbound
+                last_perwordbound = perwordbound
             # endfor em_iteration
         # endfor entire corpus update
 
