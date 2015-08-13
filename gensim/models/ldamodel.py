@@ -278,8 +278,13 @@ class LdaModel(interfaces.TransformationABC):
             if len(self.alpha) != num_topics:
                 raise RuntimeError("invalid alpha shape (must match num_topics)")
 
+        self.optimize_eta = eta == 'auto'
         if eta is None:
-            self.eta = 1.0 / num_topics
+            self.eta = 1.0 / num_topics 
+        elif eta == 'auto':
+            # this needs to be a column vector of length num_topics
+            self.eta = numpy.asarray([1.0 / num_topics for i in xrange(num_topics)]).reshape((10,1))
+            logger.info("using autotuned eta, starting with %s", list(self.eta))
         else:
             self.eta = eta
 
@@ -457,6 +462,38 @@ class LdaModel(interfaces.TransformationABC):
         logger.info("optimized alpha %s", list(self.alpha))
 
         return self.alpha
+
+    def update_eta(self, lambdat, rho):
+        """
+        Update parameters for the Dirichlet prior on the per-topic
+        word weights `eta` given the last `lambdat`.
+
+        Uses Newton's method, described in **Huang: Maximum Likelihood Estimation of Dirichlet Distribution Parameters.**
+        http://jonathan-huang.org/research/dirichlet/dirichlet.pdf
+
+        """
+        if self.eta.shape[1] != 1:
+            raise ValueError("Can't use update_eta with eta matrices, only colunmn vectors.")
+        N = float(lambdat.shape[1])
+        logphat = (sum(dirichlet_expectation(lambda_) for lambda_ in lambdat.transpose()) / N).reshape((10,1))
+        deta = numpy.copy(self.eta)
+        gradf = N * (psi(numpy.sum(self.eta)) - psi(self.eta) + logphat)
+
+        c = N * polygamma(1, numpy.sum(self.eta))
+        q = -N * polygamma(1, self.eta)
+
+        b = numpy.sum(gradf / q) / (1 / c + numpy.sum(1 / q))
+
+        deta = -(gradf - b) / q
+        #logger.info(repr(gradf.shape) + " " + repr(logphat.shape))
+        #logger.info(list(deta.reshape((10))))
+        if all(rho * deta + self.eta > 0):
+            self.eta += rho * deta
+        else:
+            logger.warning("updated eta not positive")
+        logger.info("optimized eta %s", list(self.eta.reshape((10))))
+
+        return self.eta
 
     def log_perplexity(self, chunk, total_docs=None):
         """
@@ -660,6 +697,9 @@ class LdaModel(interfaces.TransformationABC):
         self.print_topics(5)
         diffnorm = numpy.mean(numpy.abs(diff))
         logger.info("topic diff=%f, rho=%f", numpy.mean(numpy.abs(diff)), rho)
+        
+        if self.optimize_eta:
+            self.update_eta(self.state.get_lambda(), rho)
 
         if not extra_pass:
             # only update if this isn't an additional pass
