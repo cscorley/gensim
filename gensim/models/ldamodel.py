@@ -283,7 +283,7 @@ class LdaModel(interfaces.TransformationABC):
             self.eta = 1.0 / num_topics 
         elif eta == 'auto':
             # this needs to be a column vector of length num_topics
-            self.eta = numpy.asarray([1.0 / num_topics for i in xrange(num_topics)]).reshape((10,1))
+            self.eta = numpy.asarray([1.0 / num_topics for i in xrange(num_topics)]).reshape((num_topics,1))
             logger.info("using autotuned eta, starting with %s", list(self.eta))
         else:
             self.eta = eta
@@ -475,7 +475,7 @@ class LdaModel(interfaces.TransformationABC):
         if self.eta.shape[1] != 1:
             raise ValueError("Can't use update_eta with eta matrices, only colunmn vectors.")
         N = float(lambdat.shape[1])
-        logphat = (sum(dirichlet_expectation(lambda_) for lambda_ in lambdat.transpose()) / N).reshape((10,1))
+        logphat = (sum(dirichlet_expectation(lambda_) for lambda_ in lambdat.transpose()) / N).reshape((self.num_topics,1))
         deta = numpy.copy(self.eta)
         gradf = N * (psi(numpy.sum(self.eta)) - psi(self.eta) + logphat)
 
