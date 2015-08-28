@@ -34,6 +34,7 @@ The algorithm:
 
 
 import logging
+import sys
 import numpy  # for arrays, array broadcasting etc.
 
 from gensim import interfaces, utils, matutils
@@ -175,11 +176,11 @@ class LdaModel(interfaces.TransformationABC):
     Model persistency is achieved through its `load`/`save` methods.
     """
     def __init__(self, corpus=None, num_topics=100, id2word=None,
-                 distributed=False, chunksize=2000, passes=1, update_every=1,
+                 distributed=False, chunksize=None, passes=1, update_every=None,
                  alpha='symmetric', eta=None, decay=0.5, offset=1.0,
-                 eval_every=10, iterations=50, gamma_threshold=0.001,
-                 minimum_probability=0.01, 
-                 max_em_iterations=1, em_threshold=0.001):
+                 eval_every=None, iterations=50, gamma_threshold=0.001,
+                 minimum_probability=0.01, algorithm=None,
+                 max_bound_iterations=None, bound_improvement_threshold=0.001):
         """
         If given, start training from the iterable `corpus` straight away. If not given,
         the model is left untrained (presumably because you want to call `update()` manually).
@@ -205,19 +206,44 @@ class LdaModel(interfaces.TransformationABC):
         which can be used to impose asymmetric priors over the word
         distribution on a per-topic basis. This may be useful if you
         want to seed certain topics with particular words by boosting
-        the priors for those words.
+        the priors for those words. It also supports the special value 'auto'
+        which learns an asymmetric prior directly from your data.
 
         Turn on `distributed` to force distributed computing (see the `web tutorial <http://radimrehurek.com/gensim/distributed.html>`_
         on how to set up a cluster of machines for gensim).
 
-        Calculate and log perplexity estimate from the latest mini-batch every
+        Calculate and log perplexity estimate and per-word evidence lower bound (ELBO)
+        from the latest mini-batch every
         `eval_every` model updates (setting this to 1 slows down training ~2x;
         default is 10 for better performance). Set to None to disable perplexity estimation.
+        
+        Setting `max_bound_iterations` to a suitably high number will allow
+        iteration until the evidence lower bound no longer improves by more than
+        `bound_improvement_threshold` times the previous iteration's lower bound.
+        This requires perplexity estimation to be enabled.
+        
+        The algorithm will iteratively improve the topic distribution of each
+        chunk of documents every pass or bound iteration
+        until it changes by less than `gamma_threshold` or 
+        `iterations` number of iterations is reached. The number of documents
+        in a chunk is determined by `chunksize`.
+        The word distributions of
+        each topic are updated after every `update_every` chunks. Set 
+        `update_every` to 0 to update the word distributions of each topic
+        after the topic distributions have been updated for every document.
 
         `decay` and `offset` parameters are the same as Kappa and Tau_0 in
         Hoffman et al, respectively.
 
-        `minimum_probability` controls filtering the topics returned for a document (bow).
+        `minimum_probability` controls filtering the topics returned for
+        a document (bow).
+        
+        Setting `algorithm` to 'batch' will set up the
+        relevant parameters above so that
+        the algorithm used is the batch variational Bayes algorithm described
+        in Hoffman et al. Similarly, setting `algorithm` to 'online' will set
+        up the parameters above so that the algorithm used is the online 
+        variational Bayes algorithm described in Hoffman et al.
 
         Example:
 
@@ -227,6 +253,8 @@ class LdaModel(interfaces.TransformationABC):
         >>> print(lda[doc_bow])
 
         >>> lda = LdaModel(corpus, num_topics=50, alpha='auto', eval_every=5)  # train asymmetric alpha from data
+
+        >>> lda = LdaModel(corpus, num_topics=50, alpha='auto', eta='auto', algorithm='batch')  # train asymmetric alpha and eta from data using batch algorithm
 
         """
         # store user-supplied parameters
@@ -245,6 +273,56 @@ class LdaModel(interfaces.TransformationABC):
 
         if self.num_terms == 0:
             raise ValueError("cannot compute LDA over an empty collection (no terms)")
+        
+        if algorithm == 'batch':
+            if update_every is None:
+                update_every = 0 # Default for batch algorithm
+            elif update_every != 0:
+                raise ValueError("The batch algorithm requires update_every = 0.")
+            
+            if eval_every is None:
+                eval_every = 1 # Default for batch algorithm
+            elif eval_every == 0:
+                raise ValueError("The batch algorithm requires eval_every > 0.")
+
+            if chunksize is None:
+                chunksize = sys.maxint # Default for batch algorithm
+            elif chunksize < sys.maxint:
+                raise ValueError("The batch algorithm does not use multiple chunks.")
+                
+            if passes is None:
+                passes = 1
+            elif passes > 1:
+                raise ValueError("The batch algorithm does not use multiple passes.")
+
+            if max_bound_iterations is None:
+                max_bound_iterations = 1000
+            elif max_bound_iterations <= 1:
+                raise ValueError("The batch algorithm uses multiple bound iterations.")
+
+        elif algorithm == 'online':
+            if update_every is None:
+                update_every = 1 # Default for online algorithm
+            elif update_every <= 0:
+                raise ValueError("The online algorithm requires update_every > 0.")
+            
+            if max_bound_iterations is None:
+                max_bound_iterations = 1
+            elif max_bound_iterations != 1:
+                raise ValueError("The online algorithm does not use multiple bound iterations.")
+            
+        elif algorithm != None:
+            raise ValueError("Unknown algorithm specified.")
+
+        if update_every is None:
+            update_every = 1 # Default for online algorithm
+        if eval_every is None:
+            eval_every = 10 # Default for online algorithm
+        if chunksize is None:
+            chunksize = 2000 # Default for online algorithm
+        if max_bound_iterations is None:
+            max_bound_iterations = 1
+            
 
         self.distributed = bool(distributed)
         self.num_topics = int(num_topics)
@@ -258,8 +336,8 @@ class LdaModel(interfaces.TransformationABC):
         self.update_every = update_every
         self.eval_every = eval_every
         
-        self.max_em_iterations = max_em_iterations
-        self.em_threshold = em_threshold
+        self.max_bound_iterations = max_bound_iterations
+        self.bound_improvement_threshold = bound_improvement_threshold
 
         self.optimize_alpha = alpha == 'auto'
         if alpha == 'symmetric' or alpha is None:
@@ -491,7 +569,7 @@ class LdaModel(interfaces.TransformationABC):
             self.eta += rho * deta
         else:
             logger.warning("updated eta not positive")
-        logger.info("optimized eta %s", list(self.eta.reshape((10))))
+        logger.info("optimized eta %s", list(self.eta.reshape((self.num_topics))))
 
         return self.eta
 
@@ -514,7 +592,7 @@ class LdaModel(interfaces.TransformationABC):
 
     def update(self, corpus, chunksize=None, decay=None, offset=None,
                passes=None, update_every=None, eval_every=None, iterations=None,
-               gamma_threshold=None, max_em_iterations=None, em_threshold=None):
+               gamma_threshold=None, max_bound_iterations=None, bound_improvement_threshold=None):
         """
         Train the model with new documents, by EM-iterating over `corpus` until
         the topics converge (or until the maximum number of allowed iterations
@@ -532,6 +610,12 @@ class LdaModel(interfaces.TransformationABC):
         converge for any `decay` in (0.5, 1.0>. Additionally, for smaller
         `corpus` sizes, an increasing `offset` may be beneficial (see
         Table 1 in Hoffman et al.)
+        
+        Optionally, iteration until the evidence lower bound (ELBO) converges
+        (no significant improvements to topic allocations can be made)
+        can be obtained by specifying a suitably high `max_bound_iterations`
+        when using the batch update type. Batch updates can be enabled by
+        specifying `update_every=0`.
 
         """
         # use parameters given in constructor, unless user explicitly overrode them
@@ -549,10 +633,10 @@ class LdaModel(interfaces.TransformationABC):
             iterations = self.iterations
         if gamma_threshold is None:
             gamma_threshold = self.gamma_threshold
-        if max_em_iterations is None:
-            max_em_iterations = self.max_em_iterations
-        if em_threshold is None:
-            em_threshold = self.em_threshold
+        if max_bound_iterations is None:
+            max_bound_iterations = self.max_bound_iterations
+        if bound_improvement_threshold is None:
+            bound_improvement_threshold = self.bound_improvement_threshold
 
         try:
             lencorpus = len(corpus)
@@ -571,26 +655,52 @@ class LdaModel(interfaces.TransformationABC):
         if update_every:
             updatetype = "online"
             updateafter = min(lencorpus, update_every * self.numworkers * chunksize)
-            if max_em_iterations > 1:
-                logger.warn("It doesn't make sense to use max_em_iterations in online mode.")
+            if max_bound_iterations > 1:
+                raise ValueError("It doesn't make sense to use "
+                                 "max_bound_iterations in online mode.")
         else:
             updatetype = "batch"
             updateafter = lencorpus
         evalafter = min(lencorpus, (eval_every or 0) * self.numworkers * chunksize)
         
-        if max_em_iterations > 1 and not eval_every:
-            raise ValueError("eval_every must be set (usually to 1) for max_em_iterations > 1")
+        if max_bound_iterations < 1:
+            raise ValueError("max_bound_iterations must be at least 1.")
+        
+        if max_bound_iterations > 1 and not (eval_every or 0) > 0:
+            raise ValueError("eval_every must be set (usually to 1) "
+                             "for max_bound_iterations > 1")
+        
+        if max_bound_iterations > 1 and chunksize < lencorpus:
+            logger.warning("Using multiple chunks with max_bound_iterations > 1 "
+                           "isn't proven to converge.")
+
+        if max_bound_iterations > 1 and passes > 1:
+            logger.warning("Using multiple passes with max_bound_iterations > 1 "
+                           "is probably useless, decrease "
+                           "bound_improvement_threshold instead.")
 
         updates_per_pass = max(1, lencorpus / updateafter)
-        logger.info("running %s LDA training, %s topics, %i passes over "
-                    "the supplied corpus of %i documents, updating model once "
-                    "every %i documents, evaluating perplexity every %i documents, "
-                    "iterating %ix with a convergence threshold of %f",
-                    updatetype, self.num_topics, passes, lencorpus,
-                        updateafter, evalafter, iterations,
-                        gamma_threshold)
+        if max_bound_iterations > 1:
+            logger.info("running %s LDA training, %s topics, using "
+                        "the supplied corpus of %i documents, updating model once "
+                        "every %i documents, evaluating perplexity every %i documents, "
+                        "iterating %ix with a convergence threshold of %f "
+                        "until the bound improves by less than %f times the previous bound "
+                        "or the corpus has been passed over %i times.",
+                        updatetype, self.num_topics, lencorpus,
+                            updateafter, evalafter, iterations,
+                            gamma_threshold, bound_improvement_threshold,
+                            passes*max_bound_iterations)
+        else:
+            logger.info("running %s LDA training, %s topics, %i passes over "
+                        "the supplied corpus of %i documents, updating model once "
+                        "every %i documents, evaluating perplexity every %i documents, "
+                        "iterating %ix with a convergence threshold of %f",
+                        updatetype, self.num_topics, passes, lencorpus,
+                            updateafter, evalafter, iterations,
+                            gamma_threshold)
 
-        if updates_per_pass * passes < 10:
+        if updates_per_pass * passes < 10 and max_bound_iterations == 1:
             logger.warning("too few updates, training might not converge; consider "
                            "increasing the number of passes or iterations to improve accuracy")
 
@@ -603,9 +713,9 @@ class LdaModel(interfaces.TransformationABC):
         for pass_ in xrange(passes):
             num_updates_at_pass_start = self.num_updates
             last_perwordbound = 1e99
-            for em_iteration in xrange(max_em_iterations):
-                if em_iteration > 0:
-                    # reset num_updates so that we reset rho each em_iteration
+            for bound_iteration in xrange(max_bound_iterations):
+                if bound_iteration > 0:
+                    # reset num_updates so that rho is the same for each bound_iteration
                     self.num_updates = num_updates_at_pass_start
                 
                 if self.dispatcher:
@@ -616,12 +726,14 @@ class LdaModel(interfaces.TransformationABC):
                 dirty = False
 
                 reallen = 0
+                perwordbound_updated = False
                 for chunk_no, chunk in enumerate(utils.grouper(corpus, chunksize, as_numpy=True)):
                     reallen += len(chunk)  # keep track of how many documents we've processed so far
 
                     if eval_every and ((reallen == lencorpus) or ((chunk_no + 1) % (eval_every * self.numworkers) == 0)):
                         perwordbound = self.log_perplexity(chunk, total_docs=lencorpus)
-                        # keep track of the total bound for em_iterations
+                        perwordbound_updated = True
+                        # keep track of the total bound for bound_iterations
 
                     if self.dispatcher:
                         # add the chunk to dispatcher's job queue, so workers can munch on it
@@ -669,13 +781,16 @@ class LdaModel(interfaces.TransformationABC):
                     del other
                     dirty = False
                 
-                relative_improvement = (last_perwordbound-perwordbound)/last_perwordbound
-                logger.info("EM Iteration %i: %.3f per-word bound, %.6f improvement" %
-                            (em_iteration, perwordbound, relative_improvement))
-                if relative_improvement < em_threshold:
-                    break
-                last_perwordbound = perwordbound
-            # endfor em_iteration
+                if perwordbound_updated: # if eval_every > 1 improvement may be exactly 0 because 
+                                         # the bound wasnt recomputed
+                                         # it would be incorrect to terminate bound_iterations in that case
+                    relative_improvement = (last_perwordbound-perwordbound)/last_perwordbound
+                    logger.info("EM Iteration %i: %.3f per-word bound, %.6f improvement" %
+                                (bound_iteration, perwordbound, relative_improvement))
+                    if relative_improvement < bound_improvement_threshold:
+                        break
+                    last_perwordbound = perwordbound
+            # endfor bound_iteration
         # endfor entire corpus update
 
 
